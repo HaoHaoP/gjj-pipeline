@@ -1,5 +1,6 @@
 """DeepSeek LLM 条款提取 + 保存 clauses JSON"""
 import json, os, time, urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DATA_DIR = os.path.expanduser("~/Documents/nanning-gjj-rag/data")
 POLICY_DIR = os.path.join(DATA_DIR, "policies")
@@ -7,6 +8,9 @@ CLAUSE_DIR = os.path.join(DATA_DIR, "clauses")
 os.makedirs(CLAUSE_DIR, exist_ok=True)
 
 def call_deepseek(prompt, max_tokens=8192):
+    # 大文档自动扩容
+    if len(prompt) > 10000:
+        max_tokens = 16384
     api_key = os.environ["DEEPSEEK_API_KEY"]
     data = json.dumps({"model":"deepseek-chat","messages":[{"role":"user","content":prompt}],
         "max_tokens":max_tokens,"temperature":0.2}).encode()
@@ -26,38 +30,60 @@ def extract_clauses(text, title):
     for attempt in range(3):
         try:
             result = call_deepseek(prompt)
-            data = json.loads(result)
+            # 尝试直接解析
+            try:
+                data = json.loads(result)
+            except json.JSONDecodeError:
+                # JSON截断修复：用 raw_decode 提取有效部分
+                decoder = json.JSONDecoder()
+                data, _ = decoder.raw_decode(result)
             if "clauses" in data: return data
         except Exception as e:
             if attempt == 2: raise
             time.sleep(2)
     return {"clauses": []}
 
+def _extract_one(a):
+    """Extract clauses for a single document (runs in thread pool)"""
+    doc_id = a["id"]
+    md_path = os.path.join(POLICY_DIR, f"{doc_id}.md")
+    if not os.path.exists(md_path): return None
+    text = open(md_path).read()
+    if len(text) < 50: return None
+    try:
+        result = extract_clauses(text, a["title"])
+        result["doc_title"] = a["title"]
+        result["url"] = a.get("url", "")
+        out_path = os.path.join(CLAUSE_DIR, f"{doc_id}.json")
+        json.dump(result, open(out_path, 'w'), ensure_ascii=False, indent=2)
+        count = len(result.get("clauses", []))
+        print(f"  OK ({count} 条)")
+        return count
+    except Exception as e:
+        print(f"  FAIL: {e}")
+        return 0
+
 def run_extract(progress_callback=None):
     metadata = json.load(open(os.path.join(POLICY_DIR, "metadata.json")))
     total = len(metadata)
+    completed = 0
     all_clauses = 0
-    for i, a in enumerate(metadata):
-        if progress_callback:
-            progress_callback((i + 1) * 100 // total)
-        doc_id = a["id"]
-        print(f"  [{i+1}/{total}] {doc_id} ...", end=' ', flush=True)
-        try:
-            md_path = os.path.join(POLICY_DIR, f"{doc_id}.md")
-            if not os.path.exists(md_path): continue
-            text = open(md_path).read()
-            if len(text) < 50: continue
-            result = extract_clauses(text, a["title"])
-            result["doc_title"] = a["title"]
-            result["url"] = a.get("url", "")
-            out_path = os.path.join(CLAUSE_DIR, f"{doc_id}.json")
-            json.dump(result, open(out_path, 'w'), ensure_ascii=False, indent=2)
-            count = len(result.get("clauses", []))
-            all_clauses += count
-            print(f"OK ({count} 条)")
-        except Exception as e:
-            print(f"FAIL: {e}")
-        time.sleep(0.5)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {}
+        for a in metadata:
+            if len(open(os.path.join(POLICY_DIR, f"{a['id']}.md")).read() if os.path.exists(
+                    os.path.join(POLICY_DIR, f"{a['id']}.md")) else "") < 50:
+                completed += 1
+                if progress_callback: progress_callback(completed * 100 // total)
+                continue
+            futures[executor.submit(_extract_one, a)] = a["id"]
+        for i, future in enumerate(as_completed(futures)):
+            doc_id = futures[future]
+            print(f"  [{completed+1}/{total}] {doc_id} ...", end=' ', flush=True)
+            count = future.result()
+            if count: all_clauses += count
+            completed += 1
+            if progress_callback: progress_callback(completed * 100 // total)
     print(f"\n完成: {total} 篇, {all_clauses} 条条款")
     return {"success": True, "count": total, "total_clauses": all_clauses}
 

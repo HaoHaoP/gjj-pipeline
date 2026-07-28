@@ -1,5 +1,6 @@
 """HTML爬虫 + BeautifulSoup清洗 + markdownify转MD"""
-import subprocess, re, json, os, time
+import subprocess, re, json, os, time, sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 
@@ -16,19 +17,27 @@ def fetch(url):
 
 def clean_html(html):
     soup = BeautifulSoup(html, 'lxml')
-    for tag in soup.select('script,style,noscript,meta,header,footer,nav,img,iframe,.header,.footer,.nav_side,.sj_side,.clear,.apph,.fj,.downfile,.insertfileTag'):
+    for tag in soup.select('script,style,noscript,meta,header,footer,nav,img,iframe,'
+                           '.header,.footer,.nav_side,.sj_side,.clear,.apph,.fj,.downfile'):
         tag.decompose()
+    # 只移除 "相关政策解读" 文本链接，保留文件名链接
     for a in soup.select('a'):
         t = a.get_text(strip=True)
-        if '政策解读' in t or (a.get('href','') or '').endswith('.pdf') or a.get('download'):
+        if '政策解读' in t:
             a.decompose()
     content = (soup.select_one('.trs_editor_view') or soup.select_one('#UCAP-CONTENT') or
                soup.select_one('.article-content') or soup.select_one('.content'))
-    if not content: return html
+    if not content:
+        content = soup.body or soup
     for p in content.find_all(['p','div']):
         if not p.get_text(strip=True): p.decompose()
     markdown = md(str(content), heading_style='ATX', strip=None)
-    return re.sub(r'\n{3,}', '\n\n', markdown).strip()
+    markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip()
+    # 兜底：如果结果太短，用整个 body
+    if len(markdown) < 50 and soup.body:
+        body_md = md(str(soup.body), heading_style='ATX', strip=None)
+        markdown = re.sub(r'\n{3,}', '\n\n', body_md).strip()
+    return markdown
 
 def parse_list_page():
     html = fetch(BASE)
@@ -42,29 +51,47 @@ def parse_list_page():
         articles.append({"id": url_id.replace('.html',''), "url": BASE + url_id, "title": title.strip(), "date": dates[i] if i < len(dates) else ""})
     return articles
 
+def _crawl_one(a):
+    """Fetch + clean + save one document (runs in thread pool)"""
+    try:
+        raw = fetch(a['url'])
+        text = clean_html(raw)
+        with open(os.path.join(DATA_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
+        with open(os.path.join(CLEANED_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
+        a['text_length'] = len(text)
+        return len(text)
+    except Exception as e:
+        return 0
+
 def run_crawl(progress_callback=None):
     articles = parse_list_page()
     print(f"找到 {len(articles)} 篇\n")
-    for i, a in enumerate(articles):
+    total = len(articles)
+    completed = 0
+    
+    def _on_done(fut):
+        nonlocal completed
+        completed += 1
         if progress_callback:
-            progress_callback((i + 1) * 100 // len(articles))
-        print(f"  [{i+1}/{len(articles)}] {a['id']} ...", end=' ', flush=True)
-        try:
-            raw = fetch(a['url'])
-            text = clean_html(raw)
-            with open(os.path.join(DATA_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
-            with open(os.path.join(CLEANED_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
-            a['text_length'] = len(text)
-            print(f"OK ({len(text)} 字)")
-        except Exception as e:
-            print(f"FAIL: {e}")
-            a['text_length'] = 0
-        time.sleep(0.5)
+            progress_callback(completed * 100 // total)
+    
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures_map = {}
+        for a in articles:
+            f = executor.submit(_crawl_one, a)
+            futures_map[f] = a
+            f.add_done_callback(_on_done)
+        
+        for future in as_completed(futures_map):
+            a = futures_map[future]
+            chars = future.result()
+            print(f"  [{completed}/{total}] {a['id']} ... {'OK' if chars else 'FAIL'} ({chars} 字)")
+    
     with open(os.path.join(DATA_DIR, "metadata.json"), 'w') as f:
         json.dump(articles, f, ensure_ascii=False, indent=2)
-    total = sum(a.get('text_length',0) for a in articles)
-    print(f"\n完成: {len(articles)} 篇, {total} 字")
-    return {"success": True, "count": len(articles), "total_chars": total}
+    total_chars = sum(a.get('text_length', 0) for a in articles)
+    print(f"\n完成: {total} 篇, {total_chars} 字")
+    return {"success": True, "count": total, "total_chars": total_chars}
 
 if __name__ == "__main__":
     run_crawl()
