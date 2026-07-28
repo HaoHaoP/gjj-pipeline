@@ -42,10 +42,12 @@ def parse_list_page():
         articles.append({"id": url_id.replace('.html',''), "url": BASE + url_id, "title": title.strip(), "date": dates[i] if i < len(dates) else ""})
     return articles
 
-def run_crawl():
+def run_crawl(progress_callback=None):
     articles = parse_list_page()
     print(f"找到 {len(articles)} 篇\n")
     for i, a in enumerate(articles):
+        if progress_callback:
+            progress_callback((i + 1) * 100 // len(articles))
         print(f"  [{i+1}/{len(articles)}] {a['id']} ...", end=' ', flush=True)
         try:
             raw = fetch(a['url'])

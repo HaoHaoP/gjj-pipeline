@@ -2,6 +2,9 @@
 """南宁公积金 — 数据管线微服务 (FastAPI)"""
 import os, uuid, sys
 
+from dotenv import load_dotenv
+load_dotenv()  # 自动加载 .env 文件
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 import uvicorn
 
@@ -23,15 +26,15 @@ def start_sync(bg: BackgroundTasks):
     async def _sync():
         try:
             tasks[tid]["stage"] = "crawl"
-            tasks[tid]["progress"] = 5
-            result = run_crawl()
+            tasks[tid]["progress"] = 0
+            result = run_crawl(progress_callback=lambda p: tasks[tid].update(progress=int(5 + p * 15 / 100)))
             if not result.get("success"):
                 tasks[tid] = {"status": "failed", "stage": "crawl", "progress": 0, "error": "爬取+清洗失败"}
                 return
             
             tasks[tid]["stage"] = "extract"
             tasks[tid]["progress"] = 20
-            result = run_extract()
+            result = run_extract(progress_callback=lambda p: tasks[tid].update(progress=int(20 + p * 70 / 100)))
             if not result.get("success"):
                 tasks[tid] = {"status": "failed", "stage": "extract", "progress": 20, "error": "条款提取失败"}
                 return

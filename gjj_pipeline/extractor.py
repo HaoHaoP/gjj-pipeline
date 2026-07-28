@@ -33,11 +33,13 @@ def extract_clauses(text, title):
             time.sleep(2)
     return {"clauses": []}
 
-def run_extract():
+def run_extract(progress_callback=None):
     metadata = json.load(open(os.path.join(POLICY_DIR, "metadata.json")))
     total = len(metadata)
     all_clauses = 0
     for i, a in enumerate(metadata):
+        if progress_callback:
+            progress_callback((i + 1) * 100 // total)
         doc_id = a["id"]
         print(f"  [{i+1}/{total}] {doc_id} ...", end=' ', flush=True)
         try:
