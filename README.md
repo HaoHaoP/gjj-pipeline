@@ -21,6 +21,17 @@ Python 微服务，提供 FastAPI 端点供 Java 后端调用。
     └── neo4j_import.py   Neo4j数据导入
 ```
 
+## 环境变量
+
+项目需要 DeepSeek API Key 作为环境变量。仓库提供 `.env.example` 模板，实际 Key 存放在本地 `.env` 文件中（已加入 `.gitignore`，不会上传）。
+
+```bash
+# 复制模板
+cp .env.example .env
+# 编辑 .env，填入你的 API Key
+# DEEPSEEK_API_KEY=***
+```
+
 ## 启动
 
 ```bash
