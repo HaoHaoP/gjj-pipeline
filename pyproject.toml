@@ -12,9 +12,9 @@ dependencies = [
     "uvicorn",
     "beautifulsoup4",
     "lxml",
-    "markdownify",
     "requests",
     "python-dotenv",
+    "minio",
 ]
 
 [project.optional-dependencies]

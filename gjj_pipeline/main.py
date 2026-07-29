@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """南宁公积金 — 数据管线微服务 (FastAPI)"""
-import os, uuid, sys, asyncio, time
+import logging, os, uuid, sys, asyncio, threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
-load_dotenv()  # 自动加载 .env 文件
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 import uvicorn
 
-from gjj_pipeline.crawler import run_crawl, parse_list_page, _crawl_one, fetch, clean_html
-from gjj_pipeline.extractor import run_extract, _extract_one
-import json as json_mod
-import threading
-from pathlib import Path
+from gjj_pipeline.crawler import parse_list_page, _crawl_one
+from gjj_pipeline.extractor import _extract_one
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("pipeline")
 
 app = FastAPI(title="南宁公积金数据管线", version="1.0")
 tasks: dict[str, dict] = {}
@@ -24,97 +30,87 @@ def health():
 @app.post("/pipeline/sync")
 def start_sync(bg: BackgroundTasks):
     tid = str(uuid.uuid4())[:8]
-    tasks[tid] = {"status": "running", "stage": "crawl", "progress": 0, "error": None}
-    
+    tasks[tid] = {"status": "running", "stage": "crawl+extract", "progress": 0, "error": None}
+
     async def _sync():
         try:
-            tasks[tid]["stage"] = "crawl+extract"
-            tasks[tid]["progress"] = 0
-            
             articles = parse_list_page()
             total = len(articles)
-            crawled = {"count": 0}
-            extracted = {"count": 0}
-            lock = threading.Lock()
-            error = {"msg": None}
-            
-            def crawl_worker():
-                for a in articles:
-                    try:
-                        _crawl_one(a)
-                    except Exception as e:
-                        error["msg"] = str(e)
-                    with lock:
-                        crawled["count"] += 1
-            
-            def extract_worker():
-                BASE = os.path.join(os.path.expanduser("~/Documents/nanning-gjj-rag/data/policies"), "cleaned")
-                done = set()
-                while True:
-                    if error["msg"]: return
-                    with lock:
-                        if crawled["count"] >= total:
-                            time.sleep(0.5)
-                            break
-                    for a in articles:
-                        fid = a["id"]
-                        if fid in done: continue
-                        if os.path.exists(os.path.join(BASE, f"{fid}.md")):
-                            done.add(fid)
-                            try:
-                                _extract_one(a)
-                            except Exception as e:
-                                error["msg"] = str(e)
-                            with lock:
-                                extracted["count"] += 1
-                    time.sleep(0.3)
-                for a in articles:
-                    fid = a["id"]
-                    if fid in done: continue
-                    if os.path.exists(os.path.join(BASE, f"{fid}.md")):
-                        done.add(fid)
-                        try: _extract_one(a)
-                        except Exception as e: error["msg"] = str(e)
-                        with lock:
-                            extracted["count"] += 1
-            
-            def progress_loop():
-                while True:
-                    with lock:
-                        cr = crawled["count"]
-                        ex = extracted["count"]
-                    pct = int((cr * 0.15 + ex * 0.85) / total * 100) if total > 0 else 0
-                    tasks[tid]["progress"] = min(pct, 100)
-                    if cr >= total and ex >= cr:
-                        break
-                    time.sleep(0.5)
-            
-            # Run everything in threads (NOT blocking the event loop)
-            t1 = threading.Thread(target=crawl_worker, daemon=True)
-            t2 = threading.Thread(target=extract_worker, daemon=True)
-            t1.start(); t2.start()
-            
-            # Progress loop runs on the event loop via asyncio
-            loop = asyncio.get_running_loop()
-            
-            async def check_done():
-                while t1.is_alive() or t2.is_alive():
-                    with lock:
-                        cr = crawled["count"]
-                        ex = extracted["count"]
-                    pct = int((cr * 0.15 + ex * 0.85) / total * 100) if total > 0 else 0
-                    tasks[tid]["progress"] = min(pct, 100)
-                    if error["msg"]:
-                        tasks[tid] = {"status": "failed", "stage": "crawl+extract", "progress": tasks[tid]["progress"], "error": error["msg"]}
-                        return
-                    await asyncio.sleep(0.5)
-                tasks[tid] = {"status": "done", "stage": "ingest", "progress": 100, "error": None}
-            
-            await check_done()
+            logger.info("tid=%s parsed %d articles", tid, total)
+
+            def sync_all():
+                crawled = 0
+                extracted = 0
+
+                logger.info("tid=%s pipeline start %d crawl tasks", tid, total)
+                tasks[tid]["stage"] = "crawl"
+                with ThreadPoolExecutor(max_workers=8) as crawl_pool, \
+                     ThreadPoolExecutor(max_workers=6) as extract_pool:
+
+                    _first_extract = True
+                    crawl_fs = {crawl_pool.submit(_crawl_one, a): a for a in articles}
+                    extract_fs = {}
+                    extract_lock = threading.Lock()
+
+                    def _on_extract_done(fut):
+                        nonlocal extracted
+                        result = fut.result() or 0
+                        if result > 0:
+                            with extract_lock:
+                                extracted += 1
+
+                    # Phase 1: crawl — 爬完一篇立刻提交提取
+                    for f in as_completed(crawl_fs):
+                        a = crawl_fs[f]
+                        crawled += 1
+                        tasks[tid]["progress"] = int(crawled * 15 / total) if total > 0 else 0
+                        if a.get("raw_text"):
+                            if _first_extract:
+                                _first_extract = False
+                                tasks[tid]["stage"] = "crawl+extract"
+                            ef = extract_pool.submit(_extract_one, a)
+                            extract_fs[ef] = a
+                            ef.add_done_callback(_on_extract_done)
+
+                    # Phase 2: extract — base 按文档数动态计算
+                    extract_total = len(extract_fs)
+                    tasks[tid]["stage"] = "extract"
+                    if extract_total > 0:
+                        base = int(total * 100 / (total + extract_total))
+                    else:
+                        base = 15
+
+                    tasks[tid]["progress"] = base
+                    logger.info("tid=%s crawl done %d/%d articles → extract (base=%d%%)",
+                                tid, extract_total, total, base)
+
+                    if extract_total > 0:
+                        for f in as_completed(extract_fs):
+                            result = f.result() or 0
+                            if result > 0:
+                                with extract_lock:
+                                    extracted += 1
+                            pct = base + int(extracted * (100 - base) / extract_total)
+                            tasks[tid]["progress"] = min(pct, 100)
+
+                tasks[tid] = {"status": "done", "stage": "ingest", "progress": 100, "error": None,
+                              "articles": [
+                                  {"doc_id": a.get("doc_id"), "title": a["title"],
+                                   "minio_path": a.get("minio_path"),
+                                   "crawl_status": a.get("crawl_status", "unknown")}
+                                  for a in articles
+                              ]}
+
+
+            await asyncio.to_thread(sync_all)
+            done = len([a for a in articles if a.get("minio_path")])
+            logger.info("tid=%s pipeline done %d articles ingested", tid, done)
         except Exception as e:
-            tasks[tid] = {"status": "failed", "stage": tasks[tid]["stage"], "progress": tasks[tid]["progress"], "error": str(e)[:200]}
-    
+            logger.error("tid=%s pipeline failed: %s", tid, e)
+            tasks[tid] = {"status": "failed", "progress": tasks[tid].get("progress", 0), "error": str(e)[:200]}
+
     bg.add_task(_sync)
+    logger.info("task created tid=%s", tid)
     return {"taskId": tid}
 
 @app.get("/pipeline/sync/{tid}")
@@ -126,4 +122,4 @@ def get_status(tid: str):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="127.0.0.1", port=port)

@@ -1,8 +1,21 @@
-"""HTML爬虫 + BeautifulSoup清洗 + markdownify转MD"""
-import subprocess, re, json, os, time, sys
+"""HTML爬虫 + BeautifulSoup清洗 — 输出清洗后 HTML 片段供 LLM 使用"""
+import re, json, os, hashlib, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
-from markdownify import markdownify as md
+import requests
+from requests.adapters import HTTPAdapter
+from gjj_pipeline.storage import exists
+
+logger = logging.getLogger(__name__)
+from urllib3.util.retry import Retry
+
+_session = requests.Session()
+_retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
+_session.mount("https://", _adapter)
+_session.mount("http://", _adapter)
+_session.headers["User-Agent"] = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
 
 BASE = "https://gjj.nanning.gov.cn/xxgk/zcwjcx/"
 DATA_DIR = os.path.expanduser("~/Documents/nanning-gjj-rag/data/policies")
@@ -10,10 +23,9 @@ CLEANED_DIR = os.path.join(DATA_DIR, "cleaned")
 os.makedirs(CLEANED_DIR, exist_ok=True)
 
 def fetch(url):
-    r = subprocess.run(['curl','-s','-L','--max-time','15',
-        '-H','User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-        url], capture_output=True, text=True)
-    return r.stdout
+    r = _session.get(url, timeout=15)
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
 
 def clean_html(html):
     soup = BeautifulSoup(html, 'lxml')
@@ -31,13 +43,7 @@ def clean_html(html):
         content = soup.body or soup
     for p in content.find_all(['p','div']):
         if not p.get_text(strip=True): p.decompose()
-    markdown = md(str(content), heading_style='ATX', strip=None)
-    markdown = re.sub(r'\n{3,}', '\n\n', markdown).strip()
-    # 兜底：如果结果太短，用整个 body
-    if len(markdown) < 50 and soup.body:
-        body_md = md(str(soup.body), heading_style='ATX', strip=None)
-        markdown = re.sub(r'\n{3,}', '\n\n', body_md).strip()
-    return markdown
+    return str(content)
 
 def parse_list_page():
     html = fetch(BASE)
@@ -52,15 +58,33 @@ def parse_list_page():
     return articles
 
 def _crawl_one(a):
-    """Fetch + clean + save one document (runs in thread pool)"""
+    """Fetch + clean. Skip if structured MD already in MinIO. Text passed via a['raw_text']."""
+    doc_id = hashlib.md5(a["title"].encode()).hexdigest()[:8]
+    minio_path = f"{doc_id}/{a['title']}.md"
+    if exists(minio_path):
+        a['crawl_status'] = 'skipped'
+        a['minio_path'] = minio_path
+        a['doc_id'] = doc_id
+        logger.info("crawl skip (already in MinIO) doc_id=%s title=%s", doc_id, a["title"][:40])
+        return 0
     try:
+        logger.info("crawl fetching doc_id=%s id=%s", doc_id, a["id"])
         raw = fetch(a['url'])
         text = clean_html(raw)
-        with open(os.path.join(DATA_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
-        with open(os.path.join(CLEANED_DIR, f"{a['id']}.md"), 'w') as f: f.write(text)
-        a['text_length'] = len(text)
-        return len(text)
+        if len(raw) >= 100:
+            a['crawl_status'] = 'crawled'
+            a['raw_text'] = text
+            a['minio_path'] = minio_path
+            a['doc_id'] = doc_id
+            logger.info("crawl ok doc_id=%s raw=%d cleaned=%d bytes", doc_id, len(raw), len(text))
+            return len(text)
+        else:
+            a['crawl_status'] = 'failed'
+            logger.warning("crawl %s returned short content (%d bytes)", a['id'], len(raw))
+            return 0
     except Exception as e:
+        a['crawl_status'] = 'failed'
+        logger.warning("crawl fail doc_id=%s id=%s: %s", doc_id, a['id'], e)
         return 0
 
 def run_crawl(progress_callback=None):
@@ -68,6 +92,7 @@ def run_crawl(progress_callback=None):
     print(f"找到 {len(articles)} 篇\n")
     total = len(articles)
     completed = 0
+    new_count = 0
     
     def _on_done(fut):
         nonlocal completed
@@ -75,23 +100,23 @@ def run_crawl(progress_callback=None):
         if progress_callback:
             progress_callback(completed * 100 // total)
     
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures_map = {}
         for a in articles:
             f = executor.submit(_crawl_one, a)
             futures_map[f] = a
             f.add_done_callback(_on_done)
-        
+
         for future in as_completed(futures_map):
             a = futures_map[future]
             chars = future.result()
-            print(f"  [{completed}/{total}] {a['id']} ... {'OK' if chars else 'FAIL'} ({chars} 字)")
+            if chars >= 50:
+                new_count += 1
+            status = "OK" if chars >= 50 else "SKIP"
+            print(f"  [{completed}/{total}] {a['id']} ... {status} ({chars} 字)")
     
-    with open(os.path.join(DATA_DIR, "metadata.json"), 'w') as f:
-        json.dump(articles, f, ensure_ascii=False, indent=2)
-    total_chars = sum(a.get('text_length', 0) for a in articles)
-    print(f"\n完成: {total} 篇, {total_chars} 字")
-    return {"success": True, "count": total, "total_chars": total_chars}
+    print(f"\n完成: {total} 篇, {new_count} 篇新文档")
+    return {"success": True, "count": new_count}
 
 if __name__ == "__main__":
     run_crawl()

@@ -1,91 +1,142 @@
-"""DeepSeek LLM 条款提取 + 保存 clauses JSON"""
-import json, os, time, urllib.request
+"""DeepSeek LLM — 全文一次调用，输出结构化 Markdown"""
+import os, time, hashlib, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from gjj_pipeline.storage import upload_md
+
+logger = logging.getLogger(__name__)
+
+_session = requests.Session()
+_retry = Retry(total=2, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+_adapter = HTTPAdapter(max_retries=_retry, pool_connections=10, pool_maxsize=10)
+_session.mount("https://", _adapter)
 
 DATA_DIR = os.path.expanduser("~/Documents/nanning-gjj-rag/data")
 POLICY_DIR = os.path.join(DATA_DIR, "policies")
-CLAUSE_DIR = os.path.join(DATA_DIR, "clauses")
-os.makedirs(CLAUSE_DIR, exist_ok=True)
+os.makedirs(POLICY_DIR, exist_ok=True)
 
-def call_deepseek(prompt, max_tokens=8192):
-    # 大文档自动扩容
-    if len(prompt) > 10000:
-        max_tokens = 16384
-    api_key = os.environ["DEEPSEEK_API_KEY"]
-    data = json.dumps({"model":"deepseek-chat","messages":[{"role":"user","content":prompt}],
-        "max_tokens":max_tokens,"temperature":0.2}).encode()
-    req = urllib.request.Request("https://api.deepseek.com/v1/chat/completions", data,
-        headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.loads(r.read())["choices"][0]["message"]["content"]
+MD_PROMPT = """你是政策文档解析专家。请将以下南宁住房公积金政策文档整理为结构清晰、标题层级明确的 Markdown。
 
-def extract_clauses(text, title):
-    prompt = f"""你是政策文档解析专家。请将以下南宁住房公积金政策文档拆分为条款列表。
-返回 JSON 格式: {{"clauses":[{{"clause_number":"第一条","text":"..."}},...]}}
-只输出 JSON，不输出其他内容。
+要求：
+- 从原文 HTML 中识别并恢复文档标题、章节层级（# ## ###）
+- 保留全部正文内容不删减
+- 表格用 Markdown 表格格式保留
+- 只输出 Markdown，不包含任何解释或额外内容
 
 文档标题: {title}
 文档内容:
 {text}"""
-    for attempt in range(3):
-        try:
-            result = call_deepseek(prompt)
-            # 尝试直接解析
-            try:
-                data = json.loads(result)
-            except json.JSONDecodeError:
-                # JSON截断修复：用 raw_decode 提取有效部分
-                decoder = json.JSONDecoder()
-                data, _ = decoder.raw_decode(result)
-            if "clauses" in data: return data
-        except Exception as e:
-            if attempt == 2: raise
-            time.sleep(2)
-    return {"clauses": []}
 
-def _extract_one(a):
-    """Extract clauses for a single document (runs in thread pool)"""
-    doc_id = a["id"]
-    md_path = os.path.join(POLICY_DIR, f"{doc_id}.md")
-    if not os.path.exists(md_path): return None
-    text = open(md_path).read()
-    if len(text) < 50: return None
+
+def call_deepseek(prompt: str, max_tokens: int = 16384) -> str:
+    """调 DeepSeek API，返回文本内容。大文档自动扩容到 32768 tokens"""
+    if len(prompt) > 20000:
+        max_tokens = 32768
+    elif len(prompt) > 10000:
+        max_tokens = 16384
+    api_key = os.environ["DEEPSEEK_API_KEY"]
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    r = _session.post(
+        "https://api.deepseek.com/v1/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json=payload,
+        timeout=180,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+
+def _extract_one(article: dict) -> int:
+    """从 article['raw_text'] 读取清理后 HTML，LLM 输出结构化 Markdown，写入 MinIO"""
+    title = article.get("title", "")
+    raw_text = article.get("raw_text", "")
+    doc_id = article.get("doc_id", hashlib.md5(title.encode()).hexdigest()[:8])
+
+    logger.info("extract start doc_id=%s title=%s raw=%d chars", doc_id, title[:40], len(raw_text))
+    if not raw_text or len(raw_text) < 100:
+        logger.warning("extract skip doc_id=%s raw_text too short", doc_id)
+        return 0
+
     try:
-        result = extract_clauses(text, a["title"])
-        result["doc_title"] = a["title"]
-        result["url"] = a.get("url", "")
-        out_path = os.path.join(CLAUSE_DIR, f"{doc_id}.json")
-        json.dump(result, open(out_path, 'w'), ensure_ascii=False, indent=2)
-        count = len(result.get("clauses", []))
-        print(f"  OK ({count} 条)")
-        return count
+        prompt = MD_PROMPT.format(title=title, text=raw_text)
+        logger.info("extract calling LLM doc_id=%s prompt=%d chars", doc_id, len(prompt))
+        markdown = call_deepseek(prompt)
+
+        if markdown and len(markdown) >= 50:
+            # 剥掉可能的 ```markdown ... ``` 包裹
+            markdown = markdown.strip()
+            if markdown.startswith("```"):
+                nl = markdown.find("\n")
+                markdown = markdown[nl + 1 :] if nl > 0 else markdown[3:]
+            if markdown.rstrip().endswith("```"):
+                markdown = markdown.rstrip()[:-3].rstrip()
+
+            logger.info("extract uploading MD doc_id=%s md=%d bytes", doc_id, len(markdown))
+            upload_md(doc_id, title, markdown)
+            logger.info("extract done doc_id=%s md=%d bytes", doc_id, len(markdown))
+            print(f"  OK (MD {len(markdown)}字)")
+            return len(markdown)
+        else:
+            logger.warning("extract empty result doc_id=%s", doc_id)
+            return 0
     except Exception as e:
+        logger.error("extract fail doc_id=%s: %s", doc_id, e, exc_info=True)
         print(f"  FAIL: {e}")
         return 0
 
+
 def run_extract(progress_callback=None):
-    metadata = json.load(open(os.path.join(POLICY_DIR, "metadata.json")))
+    """独立提取入口：读本地 metadata.json + .md 文件"""
+    import json
+    meta_path = os.path.join(POLICY_DIR, "metadata.json")
+    if not os.path.exists(meta_path):
+        print(f"metadata.json 不存在: {meta_path}")
+        return {"success": False, "error": "metadata not found"}
+
+    metadata = json.load(open(meta_path))
     total = len(metadata)
     completed = 0
-    all_clauses = 0
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    all_md_bytes = 0
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {}
         for a in metadata:
-            if len(open(os.path.join(POLICY_DIR, f"{a['id']}.md")).read() if os.path.exists(
-                    os.path.join(POLICY_DIR, f"{a['id']}.md")) else "") < 50:
+            md_path = os.path.join(POLICY_DIR, f"{a['id']}.md")
+            if os.path.exists(md_path):
+                text = open(md_path).read()
+                if len(text) >= 100:
+                    a["raw_text"] = text
+                    a.setdefault("doc_id", hashlib.md5(a["title"].encode()).hexdigest()[:8])
+                    futures[executor.submit(_extract_one, a)] = a["id"]
+                else:
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed * 100 // total)
+            else:
                 completed += 1
-                if progress_callback: progress_callback(completed * 100 // total)
-                continue
-            futures[executor.submit(_extract_one, a)] = a["id"]
+                if progress_callback:
+                    progress_callback(completed * 100 // total)
+
         for i, future in enumerate(as_completed(futures)):
             doc_id = futures[future]
-            print(f"  [{completed+1}/{total}] {doc_id} ...", end=' ', flush=True)
-            count = future.result()
-            if count: all_clauses += count
+            print(f"  [{completed + 1}/{total}] {doc_id} ...", end=' ', flush=True)
+            md_bytes = future.result()
+            if md_bytes:
+                all_md_bytes += md_bytes
             completed += 1
-            if progress_callback: progress_callback(completed * 100 // total)
-    print(f"\n完成: {total} 篇, {all_clauses} 条条款")
-    return {"success": True, "count": total, "total_clauses": all_clauses}
+            if progress_callback:
+                progress_callback(completed * 100 // total)
+
+    print(f"\n完成: {total} 篇, 共 {all_md_bytes} 字")
+    return {"success": True, "count": total, "total_chars": all_md_bytes}
+
 
 if __name__ == "__main__":
     run_extract()
