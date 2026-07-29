@@ -11,6 +11,7 @@ import uvicorn
 
 from gjj_pipeline.crawler import parse_list_page, _crawl_one
 from gjj_pipeline.extractor import _extract_one
+from gjj_pipeline.config import (HOST, PORT as DEFAULT_PORT, CRAWL_CONCURRENCY, EXTRACT_CONCURRENCY)
 
 
 logging.basicConfig(
@@ -44,8 +45,8 @@ def start_sync(bg: BackgroundTasks):
 
                 logger.info("tid=%s pipeline start %d crawl tasks", tid, total)
                 tasks[tid]["stage"] = "crawl"
-                with ThreadPoolExecutor(max_workers=8) as crawl_pool, \
-                     ThreadPoolExecutor(max_workers=6) as extract_pool:
+                with ThreadPoolExecutor(max_workers=CRAWL_CONCURRENCY) as crawl_pool, \
+                     ThreadPoolExecutor(max_workers=EXTRACT_CONCURRENCY) as extract_pool:
 
                     _first_extract = True
                     crawl_fs = {crawl_pool.submit(_crawl_one, a): a for a in articles}
@@ -121,5 +122,5 @@ def get_status(tid: str):
     return t
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8001
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else DEFAULT_PORT
+    uvicorn.run(app, host=HOST, port=port)
