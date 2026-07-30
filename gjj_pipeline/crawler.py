@@ -41,7 +41,12 @@ def clean_html(html):
     for p in content.find_all(['p', 'div']):
         if not p.get_text(strip=True):
             p.decompose()
-    return str(content)
+    cleaned = str(content)
+    # Replace all em/en space entity variants (named, hex, decimal) with regular space
+    cleaned = re.sub(r'&emsp;|&#x2003;|&#8195;|&ensp;|&#x2002;|&#8194;', ' ', cleaned, flags=re.IGNORECASE)
+    # Collapse multiple spaces into one (common in Chinese gov docs: &emsp;&emsp; for indent)
+    cleaned = re.sub(r' {2,}', ' ', cleaned)
+    return cleaned
 
 
 def parse_list_page():

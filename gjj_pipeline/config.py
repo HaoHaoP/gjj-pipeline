@@ -18,6 +18,9 @@ CRAWL_BASE_URL = os.environ.get(
 )
 CRAWL_CONCURRENCY = int(os.environ.get("CRAWL_CONCURRENCY", "8"))
 
+# ── RAG API ──
+API_BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8080")
+
 # ── Extractor ──
 EXTRACT_CONCURRENCY = int(os.environ.get("EXTRACT_CONCURRENCY", "6"))
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")

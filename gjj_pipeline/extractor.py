@@ -3,7 +3,7 @@ import os, time, hashlib, logging
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from gjj_pipeline.storage import upload_md
+from gjj_pipeline.config import API_BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -15,14 +15,13 @@ _session.mount("https://", _adapter)
 MD_PROMPT = """你是政策文档解析专家。请将以下南宁住房公积金政策文档整理为结构清晰、标题层级明确的 Markdown。
 
 要求：
-- 从原文 HTML 中识别并恢复文档标题、章节层级（# ## ###）
-- 保留全部正文内容不删减
+- 文档大标题使用 "# " 开头（一级标题）
+- 各章标题使用 "## " 开头（二级标题），如 "## 第一章 总则"
+- 条款使用加粗格式 "**第X条**" 标记（不是标题）
+- 子项保留原文编号如（一）（二）或 1. 2.
 - 表格用 Markdown 表格格式保留
-- 只输出 Markdown，不包含任何解释或额外内容
-
-文档标题: {title}
-文档内容:
-{text}"""
+- 保留全部正文内容不删减
+- 只输出 Markdown，不包含任何解释或额外内容"""
 
 
 def call_deepseek(prompt: str, max_tokens: int = 16384) -> str:
@@ -73,9 +72,24 @@ def _extract_one(article: dict) -> int:
             if markdown.rstrip().endswith("```"):
                 markdown = markdown.rstrip()[:-3].rstrip()
 
-            logger.info("extract uploading MD doc_id=%s md=%d bytes", doc_id, len(markdown))
-            upload_md(doc_id, title, markdown)
-            logger.info("extract done doc_id=%s md=%d bytes", doc_id, len(markdown))
+            logger.info("extract ingesting doc_id=%s md=%d bytes", doc_id, len(markdown))
+            minio_path = f"{doc_id}/{title}.md"
+            resp = requests.post(
+                f"{API_BASE_URL}/api/documents/ingest",
+                json={
+                    "title": title,
+                    "content": markdown,
+                    "minioPath": minio_path,
+                    "originalFilename": f"{title}.md",
+                    "source": "SYNC",
+                    "chunkSize": 500,
+                    "overlapSize": 0,
+                    "chunkMode": "MARKDOWN"
+                },
+                timeout=120
+            )
+            resp.raise_for_status()
+            logger.info("extract done doc_id=%s md=%d bytes ingest=%s", doc_id, len(markdown), resp.json().get("data", {}).get("chunks"))
             print(f"  OK (MD {len(markdown)}字)")
             return len(markdown)
         else:

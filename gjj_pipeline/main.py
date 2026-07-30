@@ -48,38 +48,24 @@ def start_sync(bg: BackgroundTasks):
                 with ThreadPoolExecutor(max_workers=CRAWL_CONCURRENCY) as crawl_pool, \
                      ThreadPoolExecutor(max_workers=EXTRACT_CONCURRENCY) as extract_pool:
 
-                    _first_extract = True
                     crawl_fs = {crawl_pool.submit(_crawl_one, a): a for a in articles}
                     extract_fs = {}
-                    extract_lock = threading.Lock()
 
-                    def _on_extract_done(fut):
-                        nonlocal extracted
-                        result = fut.result() or 0
-                        if result > 0:
-                            with extract_lock:
-                                extracted += 1
+
 
                     # Phase 1: crawl — 爬完一篇立刻提交提取
                     for f in as_completed(crawl_fs):
                         a = crawl_fs[f]
                         crawled += 1
-                        tasks[tid]["progress"] = int(crawled * 15 / total) if total > 0 else 0
+                        tasks[tid]["progress"] = int(crawled * 10 / total) if total > 0 else 0
                         if a.get("raw_text"):
-                            if _first_extract:
-                                _first_extract = False
-                                tasks[tid]["stage"] = "crawl+extract"
                             ef = extract_pool.submit(_extract_one, a)
                             extract_fs[ef] = a
-                            ef.add_done_callback(_on_extract_done)
 
-                    # Phase 2: extract — base 按文档数动态计算
+                    # Phase 2: extract+ingest (API calls are slow) — progress 10-95%
                     extract_total = len(extract_fs)
                     tasks[tid]["stage"] = "extract"
-                    if extract_total > 0:
-                        base = int(total * 100 / (total + extract_total))
-                    else:
-                        base = 15
+                    base = 10
 
                     tasks[tid]["progress"] = base
                     logger.info("tid=%s crawl done %d/%d articles → extract (base=%d%%)",
@@ -89,10 +75,9 @@ def start_sync(bg: BackgroundTasks):
                         for f in as_completed(extract_fs):
                             result = f.result() or 0
                             if result > 0:
-                                with extract_lock:
-                                    extracted += 1
-                            pct = base + int(extracted * (100 - base) / extract_total)
-                            tasks[tid]["progress"] = min(pct, 100)
+                                extracted += 1
+                            pct = base + int(extracted * 85 / extract_total)
+                            tasks[tid]["progress"] = min(pct, 95)
 
                 tasks[tid] = {"status": "done", "stage": "ingest", "progress": 100, "error": None,
                               "articles": [
