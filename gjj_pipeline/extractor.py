@@ -32,7 +32,7 @@ def call_deepseek(prompt: str, max_tokens: int = 16384) -> str:
         max_tokens = 16384
     api_key = os.environ["DEEPSEEK_API_KEY"]
     payload = {
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0.2,

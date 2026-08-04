@@ -58,7 +58,7 @@ def extract_relations(clauses, doc_title):
         context = context[:20000]
     
     payload = json.dumps({
-        'model': 'deepseek-chat',
+        'model': 'deepseek-v4-flash',
         'messages': [
             {'role': 'system', 'content': PROMPT},
             {'role': 'user', 'content': context}

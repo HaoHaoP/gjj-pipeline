@@ -28,7 +28,7 @@ PROMPT = f"""你是南宁住房公积金政策专家。基于以下35篇政策�
 输出JSON: {{"questions":[{{"id":1,"category":"条件查询","trap":false,"question":"...","expected_answer":"..."}}]}}"""
 
 payload = json.dumps({
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "messages": [{"role": "user", "content": PROMPT}],
     "temperature": 0.3, "max_tokens": 16384,
     "response_format": {"type": "json_object"}
