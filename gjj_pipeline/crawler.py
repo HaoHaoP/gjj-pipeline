@@ -42,9 +42,9 @@ def clean_html(html):
         if not p.get_text(strip=True):
             p.decompose()
     cleaned = str(content)
-    # Replace all em/en space entity variants (named, hex, decimal) with regular space
+    # 将所有 em/en 空格实体变体（命名、十六进制、十进制）替换为普通空格
     cleaned = re.sub(r'&emsp;|&#x2003;|&#8195;|&ensp;|&#x2002;|&#8194;', ' ', cleaned, flags=re.IGNORECASE)
-    # Collapse multiple spaces into one (common in Chinese gov docs: &emsp;&emsp; for indent)
+    # 将多个连续空格合并为一个（中文政府文档常用 &emsp;&emsp; 表示缩进）
     cleaned = re.sub(r' {2,}', ' ', cleaned)
     return cleaned
 
@@ -69,17 +69,17 @@ def parse_list_page():
 
 
 def _crawl_one(a):
-    """Fetch + clean. Skip if structured MD already in MinIO. Text passed via a['raw_text']."""
+    """抓取 + 清洗。若结构化 MD 已存在于 MinIO 则跳过。文本通过 a['raw_text'] 传递。"""
     doc_id = hashlib.md5(a["title"].encode()).hexdigest()[:8]
     minio_path = f"{doc_id}/{a['title']}.md"
     if exists(minio_path):
         a['crawl_status'] = 'skipped'
         a['minio_path'] = minio_path
         a['doc_id'] = doc_id
-        logger.info("crawl skip (already in MinIO) doc_id=%s title=%s", doc_id, a["title"][:40])
+        logger.info("抓取跳过（已在 MinIO 中）doc_id=%s title=%s", doc_id, a["title"][:40])
         return 0
     try:
-        logger.info("crawl fetching doc_id=%s id=%s", doc_id, a["id"])
+        logger.info("抓取中 doc_id=%s id=%s", doc_id, a["id"])
         raw = fetch(a['url'])
         text = clean_html(raw)
         if len(raw) >= 100:
@@ -87,15 +87,15 @@ def _crawl_one(a):
             a['raw_text'] = text
             a['minio_path'] = minio_path
             a['doc_id'] = doc_id
-            logger.info("crawl ok doc_id=%s raw=%d cleaned=%d bytes", doc_id, len(raw), len(text))
+            logger.info("抓取成功 doc_id=%s 原始=%d 清洗后=%d 字节", doc_id, len(raw), len(text))
             return len(text)
         else:
             a['crawl_status'] = 'failed'
-            logger.warning("crawl %s returned short content (%d bytes)", a['id'], len(raw))
+            logger.warning("抓取 %s 返回内容过短（%d 字节）", a['id'], len(raw))
             a['minio_path'] = minio_path
             a['doc_id'] = doc_id
             return 0
     except Exception as e:
         a['crawl_status'] = 'failed'
-        logger.warning("crawl fail doc_id=%s id=%s: %s", doc_id, a['id'], e)
+        logger.warning("抓取失败 doc_id=%s id=%s：%s", doc_id, a['id'], e)
         return 0

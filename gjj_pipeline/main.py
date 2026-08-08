@@ -37,13 +37,13 @@ def start_sync(bg: BackgroundTasks):
         try:
             articles = parse_list_page()
             total = len(articles)
-            logger.info("tid=%s parsed %d articles", tid, total)
+            logger.info("tid=%s 解析到 %d 篇文章", tid, total)
 
             def sync_all():
                 crawled = 0
                 extracted = 0
 
-                logger.info("tid=%s pipeline start %d crawl tasks", tid, total)
+                logger.info("tid=%s 管线启动，共 %d 个抓取任务", tid, total)
                 tasks[tid]["stage"] = "crawl"
                 with ThreadPoolExecutor(max_workers=CRAWL_CONCURRENCY) as crawl_pool, \
                      ThreadPoolExecutor(max_workers=EXTRACT_CONCURRENCY) as extract_pool:
@@ -53,7 +53,7 @@ def start_sync(bg: BackgroundTasks):
 
 
 
-                    # Phase 1: crawl — 爬完一篇立刻提交提取
+                    # 第一阶段：抓取 — 爬完一篇立刻提交提取
                     for f in as_completed(crawl_fs):
                         a = crawl_fs[f]
                         crawled += 1
@@ -62,13 +62,13 @@ def start_sync(bg: BackgroundTasks):
                             ef = extract_pool.submit(_extract_one, a)
                             extract_fs[ef] = a
 
-                    # Phase 2: extract+ingest (API calls are slow) — progress 10-95%
+                    # 第二阶段：提取+入库（API 调用较慢）— 进度 10-95%
                     extract_total = len(extract_fs)
                     tasks[tid]["stage"] = "extract"
                     base = 10
 
                     tasks[tid]["progress"] = base
-                    logger.info("tid=%s crawl done %d/%d articles → extract (base=%d%%)",
+                    logger.info("tid=%s 抓取完成 %d/%d 篇 → 进入提取（基准=%d%%）",
                                 tid, extract_total, total, base)
 
                     if extract_total > 0:
@@ -89,14 +89,15 @@ def start_sync(bg: BackgroundTasks):
 
 
             await asyncio.to_thread(sync_all)
-            done = len([a for a in articles if a.get("minio_path")])
-            logger.info("tid=%s pipeline done %d articles ingested", tid, done)
+            # 统计实际提取成功的（_extract_one 返回 >0），而非仅看 minio_path
+            done = sum(1 for a in articles if a.get("crawl_status") == "crawled" and a.get("ingested"))
+            logger.info("tid=%s 管线完成，共入库 %d 篇文章", tid, done)
         except Exception as e:
-            logger.error("tid=%s pipeline failed: %s", tid, e)
+            logger.error("tid=%s 管线执行失败：%s", tid, e)
             tasks[tid] = {"status": "failed", "progress": tasks[tid].get("progress", 0), "error": str(e)[:200]}
 
     bg.add_task(_sync)
-    logger.info("task created tid=%s", tid)
+    logger.info("任务已创建 tid=%s", tid)
     return {"taskId": tid}
 
 @app.get("/pipeline/sync/{tid}")

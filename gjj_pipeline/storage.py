@@ -1,4 +1,4 @@
-"""Storage — MinIO 连接层"""
+"""存储层 — MinIO 连接层"""
 from io import BytesIO
 from gjj_pipeline.config import (
     MINIO_ENDPOINT, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO_BUCKET,

@@ -21,7 +21,11 @@ MD_PROMPT = """你是政策文档解析专家。请将以下南宁住房公积�
 - 子项保留原文编号如（一）（二）或 1. 2.
 - 表格用 Markdown 表格格式保留
 - 保留全部正文内容不删减
-- 只输出 Markdown，不包含任何解释或额外内容"""
+- 只输出 Markdown，不包含任何解释或额外内容
+
+文档标题：{title}
+文档内容：
+{text}"""
 
 
 def call_deepseek(prompt: str, max_tokens: int = 16384) -> str:
@@ -53,14 +57,14 @@ def _extract_one(article: dict) -> int:
     raw_text = article.get("raw_text", "")
     doc_id = article.get("doc_id", hashlib.md5(title.encode()).hexdigest()[:8])
 
-    logger.info("extract start doc_id=%s title=%s raw=%d chars", doc_id, title[:40], len(raw_text))
+    logger.info("提取开始 doc_id=%s title=%s 原文=%d 字符", doc_id, title[:40], len(raw_text))
     if not raw_text or len(raw_text) < 100:
-        logger.warning("extract skip doc_id=%s raw_text too short", doc_id)
+        logger.warning("提取跳过 doc_id=%s 原文过短", doc_id)
         return 0
 
     try:
         prompt = MD_PROMPT.format(title=title, text=raw_text)
-        logger.info("extract calling LLM doc_id=%s prompt=%d chars", doc_id, len(prompt))
+        logger.info("提取中调用 LLM doc_id=%s 提示词=%d 字符", doc_id, len(prompt))
         markdown = call_deepseek(prompt)
 
         if markdown and len(markdown) >= 50:
@@ -72,7 +76,7 @@ def _extract_one(article: dict) -> int:
             if markdown.rstrip().endswith("```"):
                 markdown = markdown.rstrip()[:-3].rstrip()
 
-            logger.info("extract ingesting doc_id=%s md=%d bytes", doc_id, len(markdown))
+            logger.info("提取入库中 doc_id=%s md=%d 字节", doc_id, len(markdown))
             minio_path = f"{doc_id}/{title}.md"
             resp = requests.post(
                 f"{API_BASE_URL}/api/documents/ingest",
@@ -89,13 +93,14 @@ def _extract_one(article: dict) -> int:
                 timeout=120
             )
             resp.raise_for_status()
-            logger.info("extract done doc_id=%s md=%d bytes ingest=%s", doc_id, len(markdown), resp.json().get("data", {}).get("chunks"))
-            print(f"  OK (MD {len(markdown)}字)")
+            logger.info("提取完成 doc_id=%s md=%d 字节 入库=%s", doc_id, len(markdown), resp.json().get("data", {}).get("chunks"))
+            print(f"  成功（MD {len(markdown)}字）")
+            article["ingested"] = True
             return len(markdown)
         else:
-            logger.warning("extract empty result doc_id=%s", doc_id)
+            logger.warning("提取结果为空 doc_id=%s", doc_id)
             return 0
     except Exception as e:
-        logger.error("extract fail doc_id=%s: %s", doc_id, e, exc_info=True)
-        print(f"  FAIL: {e}")
+        logger.error("提取失败 doc_id=%s：%s", doc_id, e, exc_info=True)
+        print(f"  失败：{e}")
         return 0
